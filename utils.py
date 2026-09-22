@@ -1,4 +1,4 @@
-"""Shared latent-state CIC model used by the empirical and simulation notebooks."""
+"""Latent-state CIC model used by the empirical and simulation notebooks."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from scipy.optimize import minimize
 from scipy.special import expit, gammaln, logsumexp
 
 
-MODEL_SPEC_VERSION = "K4_POISSON6_MEAN_FIELD_NO_ACTIVITY_CONTROL_V1"
+MODEL_SPEC_VERSION = "K4_POISSON6_MEAN_FIELD_LOG_ONLY_NO_ACTIVITY_CONTROL_V1"
 COVARIATE_TRANSFORMS = (
     "raw", "log_only", "normalize_only", "log_normalize",
 )
@@ -43,7 +43,7 @@ class LatentStateCICModel:
                  use_indiv=False, em_tol=2e-5, cic_channels=("deg", "eig"),
                  emission="poisson", alpha_mode="dim", alpha_cap=10.0,
                  obs_dims=6, mean_field=True, mf_l2=0.01,
-                 mf_maxiter=35, covariate_transform="log_normalize",
+                 mf_maxiter=35, covariate_transform="log_only",
                  verbose=False):
         self.K, self.n_em, self.seed = K, n_em, seed
         self.rho_cic = rho_cic
@@ -74,7 +74,7 @@ class LatentStateCICModel:
         order = [c for c in ("deg", "eig", "auth") if c in cic_channels]
         self.cic_channels = tuple(order)
         self.n_cic = len(self.cic_channels)
-        self.cov_mu = self.cov_sd = None   # covariate standardization (train)
+        self.cov_mu = self.cov_sd = None   # training transformation statistics
         self.reg_eta, self.reg_theta = reg_eta, reg_theta
         self.w_dir_prior = w_dir_prior   # Dirichlet(alpha) MAP on w_s rows
         self.gam_beta_prior = gam_beta_prior  # Beta(a,a) MAP on gamma: keeps the
