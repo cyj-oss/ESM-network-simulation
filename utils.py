@@ -1,4 +1,4 @@
-"""Latent-state CIC model used by the empirical and simulation notebooks."""
+"""Shared latent-state CIC model used by the empirical and simulation notebooks."""
 
 from __future__ import annotations
 
@@ -65,7 +65,8 @@ class LatentStateCICModel:
                 f"covariate_transform must be one of {COVARIATE_TRANSFORMS}"
             )
         self.covariate_transform = covariate_transform
-        self.trans_alpha_ = None       # baseline transition logits [v,u]
+        self.A_init_ = None          # fixed EM initialization only [v,u]
+        self.trans_alpha_ = None       # fitted baseline transition logits [v,u]
         self.beta_ = None              # peer-state effects [v,u,k]
         # CIC channels, canonical order deg -> eig -> auth. "deg" carries the
         # gamma/delta mix AND is the only channel through which w_s receives
@@ -385,6 +386,7 @@ class LatentStateCICModel:
         # Initialization only; fitted transitions use trans_alpha + beta * m.
         A_init = np.full((K, K), 0.05 / (K - 1)) + np.eye(K) * (0.95 - 0.05 / (K - 1))
         A_init /= A_init.sum(1, keepdims=True)
+        self.A_init_ = A_init.copy()
         trans_alpha = np.log(A_init + 1e-12)
         trans_alpha -= trans_alpha[:, -1:]
         beta = np.zeros((K, K, K), dtype=np.float64)
@@ -488,7 +490,7 @@ class LatentStateCICModel:
         use_b = self.use_indiv
         zero_b = np.zeros(Nn)
 
-        # covariate standardization stats from the CURRENT covariates,
+        # Covariate transformation statistics from the current covariates.
         # Retained outcome employee-weeks only; held fixed within this
         # M-step and reused at prediction time.
         covs_now = self._covs(self.OUT, B, w, gamma, EA)
