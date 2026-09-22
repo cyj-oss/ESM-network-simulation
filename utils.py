@@ -7,6 +7,12 @@ import scipy.sparse as sp
 from scipy.optimize import minimize
 from scipy.special import expit, gammaln, logsumexp
 
+
+MODEL_SPEC_VERSION = "K4_POISSON6_MEAN_FIELD_NO_ACTIVITY_CONTROL_V1"
+COVARIATE_TRANSFORMS = (
+    "raw", "log_only", "normalize_only", "log_normalize",
+)
+
 def transition_log_probabilities(
         mean_field, trans_alpha, beta, previous_state=None):
     """Return log transition probabilities under alpha + beta * mean_field."""
@@ -33,11 +39,12 @@ class LatentStateCICModel:
 
     def __init__(self, K=4, n_em=25, seed=0, rho_cic=0.6,
                  y_weight=10.0, sigma_b=1.0, reg_eta=0.02, reg_theta=0.05,
-                 w_dir_prior=1.1, gam_beta_prior=2.0, EXTRA=None,
+                 w_dir_prior=1.1, gam_beta_prior=2.0,
                  use_indiv=False, em_tol=2e-5, cic_channels=("deg", "eig"),
                  emission="poisson", alpha_mode="dim", alpha_cap=10.0,
                  obs_dims=6, mean_field=True, mf_l2=0.01,
-                 mf_maxiter=35, verbose=False):
+                 mf_maxiter=35, covariate_transform="log_normalize",
+                 verbose=False):
         self.K, self.n_em, self.seed = K, n_em, seed
         self.rho_cic = rho_cic
         self.y_weight, self.sigma_b = y_weight, sigma_b
@@ -53,6 +60,11 @@ class LatentStateCICModel:
         self.mean_field = bool(mean_field)
         self.mf_l2 = float(mf_l2)
         self.mf_maxiter = int(mf_maxiter)
+        if covariate_transform not in COVARIATE_TRANSFORMS:
+            raise ValueError(
+                f"covariate_transform must be one of {COVARIATE_TRANSFORMS}"
+            )
+        self.covariate_transform = covariate_transform
         self.trans_alpha_ = None       # baseline transition logits [v,u]
         self.beta_ = None              # peer-state effects [v,u,k]
         # CIC channels, canonical order deg -> eig -> auth. "deg" carries the
@@ -72,8 +84,6 @@ class LatentStateCICModel:
                                               # unregularized gamma drifts to a
                                               # 0/1 corner)
         self.verbose = verbose
-        self.EXTRA_full = EXTRA          # [T,N,E] activity controls (raw scale)
-        self.E = 0 if EXTRA is None else EXTRA.shape[-1]
 
     # ---------------- data ----------------
     def _prep(self, edges_, LSTR_, presence_mask=None):
@@ -242,7 +252,7 @@ class LatentStateCICModel:
         return self._ema(EA, self.rho_cic)
 
     def _covs(self, OUT, B, w, gamma, EA):
-        """[T,N,K,n_cic+E]: selected CIC channels + controls."""
+        """Return the selected state-specific CIC channels [T,N,K,n_cic]."""
         Oe = self._ema(OUT, self.rho_cic)
         Be = self._ema(B, self.rho_cic)
         ones = np.ones(self.K)
@@ -252,12 +262,7 @@ class LatentStateCICModel:
         chan = dict(deg=cdeg,
                     eig=EA[..., 0][..., None] * ones,
                     auth=EA[..., 1][..., None] * ones)
-        covs = np.stack([chan[c] for c in self.cic_channels], -1)
-        if self.E:
-            Tn = covs.shape[0]
-            ex = self.EXTRA_full[:Tn][:, :, None, :] * np.ones((1, 1, self.K, 1))
-            covs = np.concatenate([covs, ex], -1)
-        return covs
+        return np.stack([chan[c] for c in self.cic_channels], -1)
 
     # ---------------- likelihood pieces ----------------
     MU_FLOOR = 0.02   # below this mean, alpha is unidentifiable -> Poisson
@@ -278,18 +283,31 @@ class LatentStateCICModel:
               + X[..., None, :] * np.log(mu / (r + mu)))
         return lp.sum(-1)
 
-    def _std(self, gcv):
-        """standardize log-transformed covariates with train statistics
-        (conditioning fix: raw channels differ by orders of magnitude, which
-        both distorts theta comparisons and starves small-scale channels of
-        gradient)."""
-        if self.cov_mu is None:
-            return gcv
-        return (gcv - self.cov_mu) / self.cov_sd
+    def _covariate_base(self, covs):
+        """Apply the selected monotone transformation before any scaling."""
+        if self.covariate_transform in ("log_only", "log_normalize"):
+            return g_tr(covs)
+        return np.asarray(covs, dtype=np.float64)
+
+    def _transform_covariates(self, covs):
+        """Transform CIC covariates using statistics learned on training rows."""
+        base = self._covariate_base(covs)
+        if self.covariate_transform in ("normalize_only", "log_normalize"):
+            return (base - self.cov_mu) / self.cov_sd
+        return base
+
+    def _transform_derivative(self, raw_value, channel):
+        """Derivative of the selected CIC transform with respect to raw CIC."""
+        derivative = np.ones_like(raw_value, dtype=np.float64)
+        if self.covariate_transform in ("log_only", "log_normalize"):
+            derivative /= 1.0 + np.maximum(raw_value, 0.0)
+        if self.covariate_transform in ("normalize_only", "log_normalize"):
+            derivative /= self.cov_sd[channel]
+        return derivative
 
     def _log_y(self, covs, eta, theta, b):
         z = eta[None, None] + np.einsum("tnkc,c->tnk",
-                                        self._std(g_tr(covs)), theta) \
+                                        self._transform_covariates(covs), theta) \
             + b[None, :, None]
         p = expit(z)
         Yf = self.Yfit[..., None]
@@ -349,7 +367,7 @@ class LatentStateCICModel:
         rs = np.random.RandomState(self.seed)
         self._prep(edges_tr, LSTR_tr, presence_mask)
         K, L, Nn, Tn = self.K, self.L_, self.N_, self.T_
-        C = self.n_cic + self.E
+        C = self.n_cic
         self.Cx = C
         self.cov_mu, self.cov_sd = np.zeros(C), np.ones(C)
         self.Yfit = Y_tr.astype(np.float64)
@@ -381,7 +399,7 @@ class LatentStateCICModel:
         p0 = float(np.clip(self.Yfit[self.ymask].mean(), 1e-6, 1 - 1e-6))
         self.base = float(np.log(p0 / (1 - p0)))
         eta = self.base + 0.1 * rs.randn(K)
-        theta = np.full(C, 0.05)                 # GLOBAL theta/psi (Eq. 4)
+        theta = np.full(C, 0.05)                 # global CIC coefficients
         b = np.zeros(Nn)
         q = np.zeros((Tn, Nn, K), dtype=np.float64)
         q[self.present] = 1.0 / K
@@ -450,10 +468,9 @@ class LatentStateCICModel:
         C_deg is linear in (w, gamma) with EMA pre-applied; C_eig/C_auth are
         held fixed within the M-step (recomputed each EM iteration)."""
         K, L, Nn = self.K, self.L_, self.N_
-        C = self.n_cic + self.E
+        C = self.n_cic
         Oe = self._ema(self.OUT, self.rho_cic)
         Be = self._ema(B, self.rho_cic)
-        EXm = None if self.E == 0 else self.EXTRA_full[:self.T_]
         Yf = self.Yfit[..., None]
         um = self.ymask[..., None]
         n_eff = max(float(self.ymask.sum()), 1.0)
@@ -475,9 +492,13 @@ class LatentStateCICModel:
         # Retained outcome employee-weeks only; held fixed within this
         # M-step and reused at prediction time.
         covs_now = self._covs(self.OUT, B, w, gamma, EA)
-        gcv_now = g_tr(covs_now[self.ymask]).reshape(-1, C)
-        self.cov_mu = gcv_now.mean(0)
-        self.cov_sd = gcv_now.std(0) + 1e-6
+        base_now = self._covariate_base(covs_now[self.ymask]).reshape(-1, C)
+        if self.covariate_transform in ("normalize_only", "log_normalize"):
+            self.cov_mu = base_now.mean(0)
+            self.cov_sd = base_now.std(0) + 1e-6
+        else:
+            self.cov_mu = np.zeros(C)
+            self.cov_sd = np.ones(C)
 
         def unpack(v):
             wl = v[:K * L].reshape(K, L)
@@ -496,10 +517,7 @@ class LatentStateCICModel:
             cdeg = g_ * out_k + (1 - g_) * in_n
             blocks = ([cdeg[..., None]] if use_deg else []) + fixed_block
             covs = np.concatenate(blocks, -1)
-            if self.E:
-                covs = np.concatenate(
-                    [covs, EXm[:, :, None, :] * np.ones((1, 1, K, 1))], -1)
-            gcv = (g_tr(covs) - self.cov_mu) / self.cov_sd
+            gcv = self._transform_covariates(covs)
             z = e_[None, None] + np.einsum("tnkc,c->tnk", gcv, t_) + b_[None, :, None]
             p = expit(z)
             ll = (Yf * np.log(p + 1e-12)
@@ -513,8 +531,8 @@ class LatentStateCICModel:
             g_e = dz.sum((0, 1)) + 2 * self.reg_eta * (e_ - self.base)
             g_t = np.einsum("tnk,tnkc->c", dz, gcv) + 2 * self.reg_theta * t_
             if use_deg:      # deg is always channel 0 when present
-                dcd = dz * (t_[0] / self.cov_sd[0]) \
-                    / (1.0 + np.maximum(cdeg, 0))            # dL/dC_deg
+                dcd = dz * t_[0] * self._transform_derivative(
+                    cdeg, channel=0)                          # dL/dC_deg
                 gw = g_ * np.einsum("tnk,tnl->kl", dcd, Oe) \
                     + (1 - g_) * np.einsum("tn,tnlk->kl", dcd.sum(-1), Be)
                 gwl = w_ * (gw - (gw * w_).sum(1, keepdims=True))
@@ -544,7 +562,8 @@ class LatentStateCICModel:
         m = LatentStateCICModel(
             K=self.K, rho_cic=self.rho_cic, obs_dims=self.obs_dims,
             mean_field=self.mean_field, mf_l2=self.mf_l2,
-            mf_maxiter=self.mf_maxiter)
+            mf_maxiter=self.mf_maxiter,
+            covariate_transform=self.covariate_transform)
         m._prep(edges_all, LSTR_all, presence_mask)
         Tn, Nn, K = m.T_, m.N_, self.K
         lp = m._log_emis(self.lam, self.alpha)
@@ -598,11 +617,9 @@ class LatentStateCICModel:
                         eig=st["e"][:, None] * np.ones(K),
                         auth=st["a"][:, None] * np.ones(K))
             covs_t = np.stack([chan[c] for c in self.cic_channels], -1)
-            if self.E:
-                ext = self.EXTRA_full[t][:, None, :] * np.ones((1, K, 1))
-                covs_t = np.concatenate([covs_t, ext], -1)
             z = self.eta[None] + np.einsum("nkc,c->nk",
-                                           self._std(g_tr(covs_t)), self.theta) \
+                                           self._transform_covariates(covs_t),
+                                           self.theta) \
                 + b_stat[:, None]
             pY = expit(z)
             p[t, current] = (qf[t, current] * pY[current]).sum(-1)
@@ -614,4 +631,5 @@ DegreeOnlyLatentStateModel = LatentStateCICModel
 
 __all__ = [
     "LatentStateCICModel", "g_tr", "transition_log_probabilities",
+    "MODEL_SPEC_VERSION", "COVARIATE_TRANSFORMS",
 ]
